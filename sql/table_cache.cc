@@ -1101,7 +1101,6 @@ bool tdc_remove_table(THD *thd, enum_tdc_remove_table_type remove_type,
               thd->mdl_context.is_lock_owner(MDL_key::TABLE, db, table_name,
                                              MDL_EXCLUSIVE));
 
-
   mysql_mutex_lock(&LOCK_unused_shares);
   if (!(element= tdc_lock_share(thd, db, table_name)))
   {
