@@ -60,6 +60,7 @@
 #define MAX_SCRAMBLE_LENGTH 1024
 
 bool mysql_user_table_is_in_short_password_format= false;
+bool using_global_priv_table= true;
 
 static LEX_CSTRING native_password_plugin_name= {
   STRING_WITH_LEN("mysql_native_password")
@@ -674,7 +675,6 @@ HASH *Sp_handler_package_body::get_priv_hash() const
 */
 enum enum_acl_tables
 {
-  USER_TABLE,
   DB_TABLE,
   TABLES_PRIV_TABLE,
   COLUMNS_PRIV_TABLE,
@@ -683,7 +683,7 @@ enum enum_acl_tables
   PROCS_PRIV_TABLE,
   PROXIES_PRIV_TABLE,
   ROLES_MAPPING_TABLE,
-  TABLES_MAX // <== always the last
+  USER_TABLE // <== always the last
 };
 // bits for open_grant_tables
 static const int Table_user= 1 << USER_TABLE;
@@ -695,16 +695,17 @@ static const int Table_procs_priv= 1 << PROCS_PRIV_TABLE;
 static const int Table_proxies_priv= 1 << PROXIES_PRIV_TABLE;
 static const int Table_roles_mapping= 1 << ROLES_MAPPING_TABLE;
 
-static LEX_CSTRING MYSQL_TABLE_NAME[TABLES_MAX]= {
-  {STRING_WITH_LEN("user")},
+static LEX_CSTRING MYSQL_TABLE_NAME[USER_TABLE+1]= {
   {STRING_WITH_LEN("db")},
   {STRING_WITH_LEN("tables_priv")},
   {STRING_WITH_LEN("columns_priv")},
   {STRING_WITH_LEN("host")},
   {STRING_WITH_LEN("procs_priv")},
   {STRING_WITH_LEN("proxies_priv")},
-  {STRING_WITH_LEN("roles_mapping")}
+  {STRING_WITH_LEN("roles_mapping")},
+  {STRING_WITH_LEN("global_priv")}
 };
+static LEX_CSTRING MYSQL_TABLE_NAME_USER={STRING_WITH_LEN("user")};
 
 /**
   Choose from either native or old password plugins when assigning a password
@@ -804,6 +805,31 @@ class Grant_table_base
   TABLE *m_table;
 };
 
+/* Define User_table accesor methods to avoid copy-pasting */
+#define STR_FIELD(NAME, CS, NUM)                                            \
+  USER_TABLE_FIELD(NAME, NUM, char*, (MEM_ROOT *root), ::get_field(root,f), (const char *s, size_t l), store(s, l, CS))
+#define INT_FIELD(NAME, NUM)                                                \
+  USER_TABLE_FIELD(NAME, NUM, longlong, (), f->val_int(), (longlong x), store(x, 0))
+#define DOUBLE_FIELD(NAME, NUM)                                             \
+  USER_TABLE_FIELD(NAME, NUM, double, (), f->val_real(), (double x), store(x))
+#define ENUM_FIELD(NAME, TYPE, NUM)                                         \
+  USER_TABLE_FIELD(NAME, NUM, TYPE, (), f->val_int()-1, (TYPE x), store(x+1, 0))
+#define DECLARE_ACCESSORS                                               \
+  STR_FIELD(host, system_charset_info, 0)                               \
+  STR_FIELD(user, system_charset_info, 1)                               \
+  ENUM_FIELD(ssl_type, SSL_type, end_priv_columns)                      \
+  STR_FIELD(ssl_cipher, &my_charset_latin1, end_priv_columns + 1)       \
+  STR_FIELD(x509_issuer, &my_charset_latin1, end_priv_columns + 2)      \
+  STR_FIELD(x509_subject, &my_charset_latin1, end_priv_columns + 3)     \
+  INT_FIELD(max_questions, end_priv_columns + 4)                        \
+  INT_FIELD(max_updates, end_priv_columns + 5)                          \
+  INT_FIELD(max_connections, end_priv_columns + 6)                      \
+  INT_FIELD(max_user_connections, end_priv_columns + 7)                 \
+  DOUBLE_FIELD(max_statement_time, end_priv_columns + 13)               \
+  ENUM_FIELD(is_role, bool, end_priv_columns + 11)                      \
+  STR_FIELD(default_role, system_charset_info, end_priv_columns + 12)
+
+
 class User_table: public Grant_table_base
 {
  public:
@@ -811,6 +837,31 @@ class User_table: public Grant_table_base
   {
     return Grant_table_base::init_read_record(info) || setup_sysvars();
   }
+
+  virtual LEX_CSTRING& name() const = 0;
+  virtual void get_auth(THD *, MEM_ROOT *, const char **, const char **) const= 0;
+  virtual void set_auth(const char *, size_t, const char *, size_t) const = 0;
+  virtual ulong get_access() const = 0;
+  virtual void set_access(ulong rights, bool revoke) const = 0;
+
+#define USER_TABLE_FIELD(NAME, NUM, TYPE, GET_ARG, GETTER, SET_ARG, SETTER) \
+  virtual TYPE get_ ## NAME GET_ARG const = 0;                              \
+  virtual int set_ ## NAME SET_ARG const = 0;
+
+  DECLARE_ACCESSORS;
+
+  virtual ~User_table() {}
+ private:
+  friend class Grant_tables;
+  virtual int setup_sysvars() const = 0;
+};
+
+/* MySQL-3.23 to MariaDB 10.3 `user` table */
+class User_table_tabular: public User_table
+{
+ public:
+
+  LEX_CSTRING& name() const { return MYSQL_TABLE_NAME_USER; }
 
   void get_auth(THD *thd, MEM_ROOT *root, const char **plugin, const char **authstr) const
   {
@@ -912,43 +963,21 @@ class User_table: public Grant_table_base
     }
   }
 
-#define user_table_field(NAME, NUM, TYPE, GET_ARG, GETTER, SET_ARG, SETTER) \
+#undef USER_TABLE_FIELD
+#define USER_TABLE_FIELD(NAME, NUM, TYPE, GET_ARG, GETTER, SET_ARG, SETTER) \
   TYPE get_ ## NAME GET_ARG const                                           \
   { Field *f= get_field(NUM); return (TYPE)(f ? GETTER : 0); }              \
   int set_ ## NAME SET_ARG const                                            \
   { if (Field *f= get_field(NUM)) return f->SETTER; else return 1; }
 
-#define str_field(NAME, CS, NUM)                                            \
-  user_table_field(NAME, NUM, char*, (MEM_ROOT *root), ::get_field(root,f), (const char *s, size_t l), store(s, l, CS))
+  DECLARE_ACCESSORS;
 
-#define int_field(NAME, NUM)                                                \
-  user_table_field(NAME, NUM, longlong, (), f->val_int(), (longlong x), store(x, 0))
-
-#define double_field(NAME, NUM)                                             \
-  user_table_field(NAME, NUM, double, (), f->val_real(), (double x), store(x))
-
-#define enum_field(NAME, TYPE, NUM)                                         \
-  user_table_field(NAME, NUM, TYPE, (), f->val_int()-1, (TYPE x), store(x+1, 0))
-
-  str_field(host, system_charset_info, 0)
-  str_field(user, system_charset_info, 1)
-  enum_field(ssl_type, SSL_type, end_priv_columns)
-  str_field(ssl_cipher, &my_charset_latin1, end_priv_columns + 1)
-  str_field(x509_issuer, &my_charset_latin1, end_priv_columns + 2)
-  str_field(x509_subject, &my_charset_latin1, end_priv_columns + 3)
-  int_field(max_questions, end_priv_columns + 4)
-  int_field(max_updates, end_priv_columns + 5)
-  int_field(max_connections, end_priv_columns + 6)
-  int_field(max_user_connections, end_priv_columns + 7)
-  double_field(max_statement_time, end_priv_columns + 13)
-  enum_field(is_role, bool, end_priv_columns + 11)
-  str_field(default_role, system_charset_info, end_priv_columns + 12)
-
+  virtual ~User_table_tabular() {}
  private:
   friend class Grant_tables;
 
   /* Only Grant_tables can instantiate this class. */
-  User_table() {}
+  User_table_tabular() {}
 
   /* The user table is a bit different compared to the other Grant tables.
      Usually, we only add columns to the grant tables when adding functionality.
@@ -970,6 +999,7 @@ class User_table: public Grant_table_base
 
   int setup_sysvars() const
   {
+    using_global_priv_table= false;
     username_char_length= MY_MIN(get_field(1)->char_length(),
                                  USERNAME_CHAR_LENGTH);
 
@@ -1026,6 +1056,32 @@ class User_table: public Grant_table_base
   Field* password() const { return m_table->field[2]; }
   Field* plugin() const   { return get_field(end_priv_columns + 8); }
   Field* authstr() const  { return get_field(end_priv_columns + 9); }
+};
+
+/* MariaDB 10.4 and up `global_priv` table */
+class User_table_json: public User_table
+{
+  LEX_CSTRING& name() const { return MYSQL_TABLE_NAME[USER_TABLE]; }
+  void get_auth(THD *, MEM_ROOT *, const char **, const char **) const
+  { DBUG_ASSERT(0); }
+  void set_auth(const char *, size_t, const char *, size_t) const
+  { DBUG_ASSERT(0); }
+  ulong get_access() const
+  { DBUG_ASSERT(0); return 0; }
+  void set_access(ulong rights, bool revoke) const
+  { DBUG_ASSERT(0); }
+
+#undef USER_TABLE_FIELD
+#define USER_TABLE_FIELD(NAME, NUM, TYPE, GET_ARG, GETTER, SET_ARG, SETTER) \
+  TYPE get_ ## NAME GET_ARG const { DBUG_ASSERT(0); return (TYPE)0; }       \
+  int set_ ## NAME SET_ARG const { DBUG_ASSERT(0); return 1; }
+
+  DECLARE_ACCESSORS;
+
+  ~User_table_json() {}
+ private:
+  friend class Grant_tables;
+  int setup_sysvars() const { DBUG_ASSERT(0); return 1; }
 };
 
 class Db_table: public Grant_table_base
@@ -1143,56 +1199,14 @@ class Roles_mapping_table: public Grant_table_base
 class Grant_tables
 {
  public:
-  Grant_tables() { }
+  Grant_tables() : p_user_table(&m_user_table_json) { }
 
-  /* Before any operation is possible on grant tables, they must be opened.
-     This opens the tables according to the lock type specified during
-     construction.
-
-     @retval  1 replication filters matched. Abort the operation,
-                but return OK (!)
-     @retval  0 tables were opened successfully
-     @retval -1 error, tables could not be opened
-  */
   int open_and_lock(THD *thd, int which_tables, enum thr_lock_type lock_type)
   {
     DBUG_ENTER("Grant_tables::open_and_lock");
-    TABLE_LIST tables[TABLES_MAX], *first= NULL;
+    TABLE_LIST tables[USER_TABLE+1], *first= NULL;
 
     DBUG_ASSERT(which_tables); /* At least one table must be opened. */
-    for (int i=TABLES_MAX-1; i >=0; i--)
-    {
-      TABLE_LIST *tl= tables + i;
-      if (which_tables & (1 << i))
-      {
-        tl->init_one_table(&MYSQL_SCHEMA_NAME, &MYSQL_TABLE_NAME[i],
-                           NULL, lock_type);
-        tl->open_type= OT_BASE_ONLY;
-        tl->updating= lock_type >= TL_WRITE_ALLOW_WRITE;
-        tl->open_strategy= i >= FIRST_OPTIONAL_TABLE
-          ? TABLE_LIST::OPEN_IF_EXISTS : TABLE_LIST::OPEN_NORMAL;
-        tl->next_global= tl->next_local= first;
-        first= tl;
-      }
-      else
-        tl->table= NULL;
-    }
-#ifdef HAVE_REPLICATION
-    if (lock_type >= TL_WRITE_ALLOW_WRITE &&
-        thd->slave_thread && !thd->spcont)
-    {
-      /*
-        GRANT and REVOKE are applied the slave in/exclusion rules as they are
-        some kind of updates to the mysql.% tables.
-      */
-      Rpl_filter *rpl_filter= thd->system_thread_info.rpl_sql_info->rpl_filter;
-      if (rpl_filter->is_on() && !rpl_filter->tables_ok(0, first))
-        DBUG_RETURN(1);
-    }
-#endif
-    if (open_and_lock_tables(thd, first, FALSE, MYSQL_LOCK_IGNORE_TIMEOUT))
-      DBUG_RETURN(-1);
-
     /*
        We can read privilege tables even when !initialized.
        This can be acl_load() - server startup or FLUSH PRIVILEGES
@@ -1203,7 +1217,45 @@ class Grant_tables
       DBUG_RETURN(-1);
     }
 
-    m_user_table.set_table(tables[USER_TABLE].table);
+    for (int i=USER_TABLE; i >=0; i--)
+    {
+      TABLE_LIST *tl= tables + i;
+      if (which_tables & (1 << i))
+      {
+        tl->init_one_table(&MYSQL_SCHEMA_NAME, &MYSQL_TABLE_NAME[i],
+                           NULL, lock_type);
+        tl->updating= lock_type >= TL_WRITE_ALLOW_WRITE;
+        if (i >= FIRST_OPTIONAL_TABLE)
+          tl->open_strategy= TABLE_LIST::OPEN_IF_EXISTS;
+        tl->next_global= tl->next_local= first;
+        first= tl;
+      }
+      else
+        tl->table= NULL;
+    }
+
+    uint counter;
+    int res= really_open(thd, first, &counter);
+
+    /* if User_table_json wasn't found, let's try User_table_tabular */
+    if (!res && (which_tables & Table_user) && !(tables[USER_TABLE].table))
+    {
+      uint unused;
+      TABLE_LIST *tl= tables + USER_TABLE;
+      tl->init_one_table(&MYSQL_SCHEMA_NAME, &MYSQL_TABLE_NAME_USER,
+                         NULL, lock_type);
+      tl->updating= lock_type >= TL_WRITE_ALLOW_WRITE;
+      p_user_table= &m_user_table_tabular;
+      counter++;
+      res= really_open(thd, tl, &unused);
+    }
+    if (res)
+      DBUG_RETURN(res);
+
+    if (lock_tables(thd, first, counter, MYSQL_LOCK_IGNORE_TIMEOUT))
+      DBUG_RETURN(-1);
+
+    p_user_table->set_table(tables[USER_TABLE].table);
     m_db_table.set_table(tables[DB_TABLE].table);
     m_tables_priv_table.set_table(tables[TABLES_PRIV_TABLE].table);
     m_columns_priv_table.set_table(tables[COLUMNS_PRIV_TABLE].table);
@@ -1215,7 +1267,7 @@ class Grant_tables
   }
 
   inline const User_table& user_table() const
-  { return m_user_table; }
+  { return *p_user_table; }
 
   inline const Db_table& db_table() const
   { return m_db_table; }
@@ -1239,7 +1291,38 @@ class Grant_tables
   { return m_roles_mapping_table; }
 
  private:
-  User_table m_user_table;
+
+  /* Before any operation is possible on grant tables, they must be opened.
+
+     @retval  1 replication filters matched. Abort the operation,
+                but return OK (!)
+     @retval  0 tables were opened successfully
+     @retval -1 error, tables could not be opened
+  */
+  int really_open(THD *thd, TABLE_LIST* tables, uint *counter)
+  {
+    DBUG_ENTER("Grant_tables::really_open:");
+#ifdef HAVE_REPLICATION
+    if (tables->lock_type >= TL_WRITE_ALLOW_WRITE &&
+        thd->slave_thread && !thd->spcont)
+    {
+      /*
+        GRANT and REVOKE are applied the slave in/exclusion rules as they are
+        some kind of updates to the mysql.% tables.
+      */
+      Rpl_filter *rpl_filter= thd->system_thread_info.rpl_sql_info->rpl_filter;
+      if (rpl_filter->is_on() && !rpl_filter->tables_ok(0, tables))
+        DBUG_RETURN(1);
+    }
+#endif
+    if (open_tables(thd, &tables, counter, MYSQL_LOCK_IGNORE_TIMEOUT))
+      DBUG_RETURN(-1);
+    DBUG_RETURN(0);
+  }
+
+  User_table *p_user_table;
+  User_table_json m_user_table_json;
+  User_table_tabular m_user_table_tabular;
   Db_table m_db_table;
   Tables_priv_table m_tables_priv_table;
   Columns_priv_table m_columns_priv_table;
@@ -2998,7 +3081,7 @@ bool change_password(THD *thd, LEX_USER *user)
   save_binlog_format= thd->set_current_stmt_binlog_format_stmt();
 
   if (WSREP(thd) && !IF_WSREP(thd->wsrep_applier, 0))
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, (char*)"user", NULL);
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
 
   if ((result= tables.open_and_lock(thd, Table_user, TL_WRITE)))
     DBUG_RETURN(result != 1);
@@ -3121,7 +3204,7 @@ int acl_set_default_role(THD *thd, const char *host, const char *user,
   {
     thd->set_query(buff, query_length, system_charset_info);
     // Attention!!! here is implicit goto error;
-    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, (char*)"user", NULL);
+    WSREP_TO_ISOLATION_BEGIN(WSREP_MYSQL_DB, NULL, NULL);
   }
 
   /*
@@ -3650,7 +3733,8 @@ static int replace_user_table(THD *thd, const User_table &user_table,
     if (user_table.set_is_role(true))
     {
       my_error(ER_COL_COUNT_DOESNT_MATCH_PLEASE_UPDATE, MYF(0),
-               "user", ROLE_ASSIGN_COLUMN_IDX + 1, user_table.num_fields(),
+               user_table.name().str,
+               ROLE_ASSIGN_COLUMN_IDX + 1, user_table.num_fields(),
                static_cast<int>(table->s->mysql_version), MYSQL_VERSION_ID);
       goto end;
     }
