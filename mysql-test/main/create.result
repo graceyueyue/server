@@ -405,7 +405,7 @@ ERROR 42S01: Table 't3' already exists
 create table non_existing_database.t1 like t1;
 ERROR 42000: Unknown database 'non_existing_database'
 create table t3 like non_existing_table;
-ERROR 42S02: Table 'test.non_existing_table' doesn't exist
+ERROR 42S01: Table 't3' already exists
 create temporary table t3 like t1;
 ERROR 42S01: Table 't3' already exists
 drop table t1, t2, t3;
@@ -907,15 +907,17 @@ unlock tables;
 create table t2 (j int);
 lock tables t1 read;
 create table t2 select * from t1;
-ERROR HY000: Table 't2' was not locked with LOCK TABLES
+ERROR 42S01: Table 't2' already exists
 create table if not exists t2 select * from t1;
-ERROR HY000: Table 't2' was not locked with LOCK TABLES
+Warnings:
+Note	1050	Table 't2' already exists
 unlock tables;
 lock table t1 read, t2 read;
 create table t2 select * from t1;
-ERROR HY000: Table 't2' was locked with a READ lock and can't be updated
+ERROR 42S01: Table 't2' already exists
 create table if not exists t2 select * from t1;
-ERROR HY000: Table 't2' was locked with a READ lock and can't be updated
+Warnings:
+Note	1050	Table 't2' already exists
 unlock tables;
 lock table t1 read, t2 write;
 create table t2 select * from t1;

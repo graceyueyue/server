@@ -2921,7 +2921,7 @@ begin
   create table t2 as select * from t3;
 end|
 
--- error 1146
+-- error ER_TABLE_EXISTS_ERROR
 call bug4904()|
 
 drop procedure bug4904|

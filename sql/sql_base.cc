@@ -3919,10 +3919,7 @@ lock_table_names(THD *thd, const DDL_options_st &options,
   MDL_request_list mdl_requests;
   TABLE_LIST *table;
   MDL_request global_request;
-  ulong org_lock_wait_timeout= lock_wait_timeout;
-  /* Check if we are using CREATE TABLE ... IF NOT EXISTS */
-  bool create_table;
-  Dummy_error_handler error_handler;
+  bool res;
   DBUG_ENTER("lock_table_names");
 
   DBUG_ASSERT(!thd->locked_tables_mode);
@@ -3965,11 +3962,6 @@ lock_table_names(THD *thd, const DDL_options_st &options,
   if (mdl_requests.is_empty())
     DBUG_RETURN(FALSE);
 
-  /* Check if CREATE TABLE without REPLACE was used */
-  create_table= ((thd->lex->sql_command == SQLCOM_CREATE_TABLE ||
-                  thd->lex->sql_command == SQLCOM_CREATE_SEQUENCE) &&
-                 !options.or_replace());
-
   if (!(flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
   {
     /*
@@ -3982,58 +3974,12 @@ lock_table_names(THD *thd, const DDL_options_st &options,
     global_request.init(MDL_key::BACKUP, "", "", MDL_BACKUP_DDL,
                         MDL_STATEMENT);
     mdl_requests.push_front(&global_request);
-
-    if (create_table)
-#ifdef WITH_WSREP
-      if (thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
-          thd->wsrep_exec_mode != REPL_RECV)
-#endif
-      lock_wait_timeout= 0;                     // Don't wait for timeout
   }
 
-  for (;;)
-  {
-    if (create_table)
-      thd->push_internal_handler(&error_handler);  // Avoid warnings & errors
-    bool res= thd->mdl_context.acquire_locks(&mdl_requests, lock_wait_timeout);
-    if (!(flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
-      thd->mdl_backup_ticket= global_request.ticket;
-    if (create_table)
-      thd->pop_internal_handler();
-    if (!res)
-      DBUG_RETURN(FALSE);                       // Got locks
-
-    if (!create_table)
-      DBUG_RETURN(TRUE);                        // Return original error
-
-    /*
-      We come here in the case of lock timeout when executing CREATE TABLE.
-      Verify that table does exist (it usually does, as we got a lock conflict)
-    */
-    if (ha_table_exists(thd, &tables_start->db, &tables_start->table_name))
-    {
-      if (options.if_not_exists())
-      {
-        push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
-                            ER_TABLE_EXISTS_ERROR,
-                            ER_THD(thd, ER_TABLE_EXISTS_ERROR),
-                            tables_start->table_name.str);
-      }
-      else
-        my_error(ER_TABLE_EXISTS_ERROR, MYF(0), tables_start->table_name.str);
-      DBUG_RETURN(TRUE);
-    }
-    /*
-      We got error from acquire_locks, but the table didn't exists.
-      This could happen if another connection runs a statement
-      involving this non-existent table, and this statement took the mdl,
-      but didn't error out with ER_NO_SUCH_TABLE yet (yes, a race condition).
-      We play safe and restart the original acquire_locks with the
-      original timeout.
-    */
-    create_table= 0;
-    lock_wait_timeout= org_lock_wait_timeout;
-  }
+  res= thd->mdl_context.acquire_locks(&mdl_requests, lock_wait_timeout);
+  if (!res && !(flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
+    thd->mdl_backup_ticket= global_request.ticket;
+  DBUG_RETURN(res);
 }
 
 

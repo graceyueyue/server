@@ -4118,6 +4118,22 @@ mysql_execute_command(THD *thd)
     }
 #endif
 
+    if (ha_table_exists(thd, &create_table->db, &create_table->table_name) &&
+        !create_info.or_replace() && !create_info.tmp_table())
+    {
+      if (create_info.if_not_exists())
+      {
+        push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
+                            ER_TABLE_EXISTS_ERROR,
+                            ER_THD(thd, ER_TABLE_EXISTS_ERROR),
+                            create_table->table_name.str);
+        my_ok(thd);
+      }
+      else
+        my_error(ER_TABLE_EXISTS_ERROR, MYF(0), create_table->table_name.str);
+      goto end_with_restore_list;
+    }
+
     if (select_lex->item_list.elements)		// With select
     {
       select_result *result;
