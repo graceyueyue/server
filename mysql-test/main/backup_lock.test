@@ -84,8 +84,7 @@ let $wait_condition=
 --error ER_LOCK_WAIT_TIMEOUT
 SET STATEMENT lock_wait_timeout=0 FOR SELECT * FROM t1;
 
---error ER_LOCK_WAIT_TIMEOUT
-SET STATEMENT lock_wait_timeout=0 FOR backup stage block_ddl;
+backup stage block_ddl;
 SELECT LOCK_MODE, LOCK_TYPE, TABLE_SCHEMA, TABLE_NAME FROM information_schema.metadata_lock_info;
 backup stage end;
 select user,db,Info from information_schema.processlist where user <> "system user" order by Info;
@@ -138,15 +137,10 @@ SET STATEMENT lock_wait_timeout=0 FOR DROP TABLE t1;
 connection con2;
 backup stage start;
 backup stage flush;
---send backup stage block_ddl
+backup stage block_ddl;
 connection default;
-let $wait_condition=
-    select count(*) = 1 from information_schema.processlist
-    where state = "Waiting for backup lock";
---source include/wait_condition.inc
 commit;
 connection con2;
---reap
 backup stage end;
 connection con1;
 --reap  # DROP TABLE
@@ -232,3 +226,38 @@ DROP TABLE t_permanent_myisam, t_permanent_innodb;
 DROP TABLE t_con1_innodb, t_con1_myisam;
 --disconnect con1
 set global lock_wait_timeout=default;
+
+--echo #
+--echo # Make sure pending LOCK TABLES doesn't block BACKUP STAGE
+--echo #
+CREATE TABLE t1(a INT);
+LOCK TABLE t1 READ;
+
+--echo #
+connect (con1,localhost,root,,);
+SET DEBUG_SYNC= 'mdl_acquire_lock_wait SIGNAL ready';
+--send LOCK TABLE t1 WRITE
+
+--echo #
+connect (con2,localhost,root,,);
+SET DEBUG_SYNC= 'now WAIT_FOR ready';
+BACKUP STAGE START;
+BACKUP STAGE FLUSH;
+BACKUP STAGE BLOCK_DDL;
+BACKUP STAGE END;
+disconnect con2;
+
+--echo #
+connection default;
+UNLOCK TABLES;
+
+--echo #
+connection con1;
+reap;
+UNLOCK TABLES;
+disconnect con1;
+
+--echo #
+connection default;
+DROP TABLE t1;
+SET DEBUG_SYNC= 'RESET';

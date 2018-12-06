@@ -3919,7 +3919,7 @@ lock_table_names(THD *thd, const DDL_options_st &options,
   MDL_request_list mdl_requests;
   TABLE_LIST *table;
   MDL_request global_request;
-  bool res;
+  MDL_savepoint mdl_savepoint;
   DBUG_ENTER("lock_table_names");
 
   DBUG_ASSERT(!thd->locked_tables_mode);
@@ -3962,24 +3962,42 @@ lock_table_names(THD *thd, const DDL_options_st &options,
   if (mdl_requests.is_empty())
     DBUG_RETURN(FALSE);
 
-  if (!(flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
-  {
-    /*
-      Protect this statement against concurrent global read lock
-      by acquiring global intention exclusive lock with statement
-      duration.
-    */
-    if (thd->has_read_only_protection())
-      DBUG_RETURN(TRUE);
-    global_request.init(MDL_key::BACKUP, "", "", MDL_BACKUP_DDL,
-                        MDL_STATEMENT);
-    mdl_requests.push_front(&global_request);
-  }
+  if (flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK)
+    DBUG_RETURN(thd->mdl_context.acquire_locks(&mdl_requests,
+                                               lock_wait_timeout));
 
-  res= thd->mdl_context.acquire_locks(&mdl_requests, lock_wait_timeout);
-  if (!res && !(flags & MYSQL_OPEN_SKIP_SCOPED_MDL_LOCK))
-    thd->mdl_backup_ticket= global_request.ticket;
-  DBUG_RETURN(res);
+  /* Protect this statement against concurrent BACKUP STAGE or FTWRL. */
+  if (thd->has_read_only_protection())
+    DBUG_RETURN(true);
+
+  global_request.init(MDL_key::BACKUP, "", "", MDL_BACKUP_DDL, MDL_STATEMENT);
+  mdl_savepoint= thd->mdl_context.mdl_savepoint();
+
+  while (!thd->mdl_context.acquire_locks(&mdl_requests, lock_wait_timeout) &&
+         !thd->mdl_context.try_acquire_lock(&global_request))
+  {
+    if (global_request.ticket)
+    {
+      thd->mdl_backup_ticket= global_request.ticket;
+      DBUG_RETURN(false);
+    }
+
+    /*
+      There is ongoing or pending BACKUP STAGE or FTWRL.
+      Wait until it finishes and re-try.
+    */
+    thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
+    if (thd->mdl_context.acquire_lock(&global_request, lock_wait_timeout))
+      break;
+    thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
+
+    /* Reset tickets for all acquired locks */
+    global_request.ticket= 0;
+    MDL_request_list::Iterator it(mdl_requests);
+    while (auto mdl_request= it++)
+      mdl_request->ticket= 0;
+  }
+  DBUG_RETURN(true);
 }
 
 
