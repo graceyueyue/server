@@ -1831,12 +1831,10 @@ int Field::store(const char *to, size_t length, CHARSET_INFO *cs,
 }
 
 
-int Field::store_timestamp(my_time_t ts, ulong sec_part)
+int Field::store_timestamp_dec(const timeval &ts, uint dec)
 {
-  MYSQL_TIME ltime;
-  THD *thd= get_thd();
-  thd->timestamp_to_TIME(&ltime, ts, sec_part, date_mode_t(0));
-  return store_time_dec(&ltime, decimals());
+  Datetime dt(get_thd(), ts);
+  return store_time_dec(dt.get_mysql_time(), dec);
 }
 
 /**
@@ -5026,6 +5024,22 @@ my_time_t Field_timestamp::get_timestamp(const uchar *pos,
 }
 
 
+bool Field_timestamp::val_native(Native *to)
+{
+  int32 nr= sint4korr(ptr);
+  if (!nr)
+  {
+    to->length(0); // Zero datetime '0000-00-00 00:00:00'
+    return false;
+  }
+  if (to->alloc(4))
+    return true;
+  mi_int4store((uchar *) to->ptr(), nr);
+  to->length(4);
+  return false;
+}
+
+
 int Field_timestamp::store_TIME_with_warning(THD *thd, const Datetime *dt,
                                              const ErrConv *str, int was_cut)
 {
@@ -5126,11 +5140,11 @@ int Field_timestamp::store(longlong nr, bool unsigned_val)
 }
 
 
-int Field_timestamp::store_timestamp(my_time_t ts, ulong sec_part)
+int Field_timestamp::store_timestamp_dec(const timeval &ts, uint dec)
 {
   int warn= 0;
   time_round_mode_t mode= Datetime::default_round_mode(get_thd());
-  store_TIMESTAMP(Timestamp(ts, sec_part).round(decimals(), mode, &warn));
+  store_TIMESTAMP(Timestamp(ts).round(decimals(), mode, &warn));
   if (warn)
   {
     /*
@@ -5144,7 +5158,7 @@ int Field_timestamp::store_timestamp(my_time_t ts, ulong sec_part)
     */
     set_warning(Sql_condition::WARN_LEVEL_WARN, ER_WARN_DATA_OUT_OF_RANGE, 1);
   }
-  if (ts == 0 && sec_part == 0 &&
+  if (ts.tv_sec == 0 && ts.tv_usec == 0 &&
       get_thd()->variables.sql_mode & (ulonglong) TIME_NO_ZERO_DATE)
   {
     ErrConvString s(
@@ -5412,6 +5426,18 @@ my_time_t Field_timestamp_hires::get_timestamp(const uchar *pos,
   *sec_part= (long)sec_part_unshift(read_bigendian(pos+4, sec_part_bytes(dec)), dec);
   return mi_uint4korr(pos);
 }
+
+
+bool Field_timestamp_hires::val_native(Native *to)
+{
+  ASSERT_COLUMN_MARKED_FOR_READ;
+  struct timeval tm;
+  tm.tv_sec= mi_uint4korr(ptr);
+  tm.tv_usec= (ulong) sec_part_unshift(read_bigendian(ptr+4, sec_part_bytes(dec)), dec);
+  return Timestamp_or_zero_datetime(Timestamp(tm), tm.tv_sec == 0).
+           to_native(to, dec);
+}
+
 
 double Field_timestamp_with_dec::val_real(void)
 {

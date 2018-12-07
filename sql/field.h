@@ -784,7 +784,21 @@ public:
   virtual int  store(longlong nr, bool unsigned_val)=0;
   virtual int  store_decimal(const my_decimal *d)=0;
   virtual int  store_time_dec(const MYSQL_TIME *ltime, uint dec);
-  virtual int  store_timestamp(my_time_t timestamp, ulong sec_part);
+  virtual int  store_timestamp_dec(const timeval &ts, uint dec);
+  int store_timestamp(my_time_t timestamp, ulong sec_part)
+  {
+    return store_timestamp_dec(Timeval(timestamp, sec_part),
+                               TIME_SECOND_PART_DIGITS);
+  }
+  /**
+    Store a value represented in native format
+  */
+  virtual int store_native(const Native &value)
+  {
+    DBUG_ASSERT(0);
+    reset();
+    return 0;
+  }
   int store_time(const MYSQL_TIME *ltime)
   { return store_time_dec(ltime, TIME_SECOND_PART_DIGITS); }
   int store(const char *to, size_t length, CHARSET_INFO *cs,
@@ -831,6 +845,11 @@ public:
      This trickery is used to decrease a number of malloc calls.
   */
   virtual String *val_str(String*,String *)=0;
+  virtual bool val_native(Native *to)
+  {
+    DBUG_ASSERT(!is_null());
+    return to->copy((const char *) ptr, pack_length());
+  }
   String *val_int_as_str(String *val_buffer, bool unsigned_flag);
   /*
     Return the field value as a LEX_CSTRING, without padding to full length
@@ -2744,7 +2763,7 @@ public:
   int  store(longlong nr, bool unsigned_val);
   int  store_time_dec(const MYSQL_TIME *ltime, uint dec);
   int  store_decimal(const my_decimal *);
-  int  store_timestamp(my_time_t timestamp, ulong sec_part);
+  int  store_timestamp_dec(const timeval &ts, uint dec);
   int  save_in_field(Field *to);
   double val_real(void);
   longlong val_int(void);
@@ -2780,6 +2799,16 @@ public:
     store_TIMESTAMP(Timestamp(ts, sec_part).round(decimals(), mode, &warn));
   }
   bool get_date(MYSQL_TIME *ltime, date_mode_t fuzzydate);
+  int store_native(const Native &value)
+  {
+    Timestamp_or_zero_datetime tm(value);
+    if (tm.is_zero_datetime())
+      reset();
+    else
+      store_TIMESTAMP(tm);
+    return 0;
+  }
+  bool val_native(Native *to);
   uchar *pack(uchar *to, const uchar *from,
               uint max_length __attribute__((unused)))
   {
@@ -2859,6 +2888,7 @@ public:
   {
     DBUG_ASSERT(dec);
   }
+  bool val_native(Native *to);
   my_time_t get_timestamp(const uchar *pos, ulong *sec_part) const;
   int cmp(const uchar *,const uchar *);
   uint32 pack_length() const { return 4 + sec_part_bytes(dec); }
@@ -2908,6 +2938,16 @@ public:
   my_time_t get_timestamp(ulong *sec_part) const
   {
     return get_timestamp(ptr, sec_part);
+  }
+  bool val_native(Native *to)
+  {
+    // Check if it's '0000-00-00 00:00:00' rather than a real timestamp
+    if (ptr[0] == 0 && ptr[1] == 0 && ptr[2] == 0 && ptr[3] == 0)
+    {
+      to->length(0);
+      return false;
+    }
+    return Field::val_native(to);
   }
   uint size_of() const { return sizeof(*this); }
 };
